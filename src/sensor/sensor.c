@@ -27,6 +27,7 @@
 #include "calibration.h"
 
 #include <math.h>
+#include <zephyr/drivers/gpio.h>
 
 #include "fusion/fusions.h"
 #include "sensors.h"
@@ -34,6 +35,16 @@
 #include "sensor.h"
 
 #define SPI_OP SPI_MODE_CPOL | SPI_MODE_CPHA | SPI_WORD_SET(8)
+
+// IMU power control GPIO definitions
+#define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
+#define IMU_POWER_CONTROL_AVAILABLE true
+static const struct gpio_dt_spec imu_pwr = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, pwr_gpios);
+static const struct gpio_dt_spec imu_gnd = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, gnd_gpios);
+#else
+#define IMU_POWER_CONTROL_AVAILABLE false
+#endif
 
 #if DT_NODE_HAS_STATUS(DT_NODELABEL(imu_spi), okay)
 #define SENSOR_IMU_SPI_EXISTS true
@@ -136,6 +147,34 @@ static void sensor_loop(void);
 static struct k_thread sensor_thread_id;
 static K_THREAD_STACK_DEFINE(sensor_thread_id_stack, 1024);
 
+// IMU power cycle function for recovery from clock issues
+static int sensor_imu_power_cycle(void)
+{
+#if IMU_POWER_CONTROL_AVAILABLE
+	LOG_INF("Attempting IMU power cycle for recovery");
+
+	// Turn off IMU power
+	gpio_pin_set_dt(&imu_pwr, 0);
+	gpio_pin_set_dt(&imu_gnd, 1); // Pull ground low to ensure complete power-off
+
+	// Wait for capacitors to discharge and ensure complete power-off
+	k_msleep(100);
+
+	// Restore IMU power
+	gpio_pin_set_dt(&imu_gnd, 0);
+	gpio_pin_set_dt(&imu_pwr, 1);
+
+	// Wait for IMU to stabilize after power-on
+	k_msleep(50);
+
+	LOG_INF("IMU power cycle complete");
+	return 0;
+#else
+	LOG_WRN("IMU power control not available, cannot perform power cycle");
+	return -1;
+#endif
+}
+
 K_THREAD_DEFINE(sensor_init_thread_id, 256, sensor_request_scan, true, NULL, NULL, 7, 0, 0);
 
 const char *sensor_get_sensor_imu_name(void)
@@ -173,6 +212,20 @@ void sensor_scan_thread(void)
 		sensor_imu_dev.addr = 0x00;
 
 		err = sensor_scan(); // on POR, the sensor may not be ready yet
+
+		// If still failed and IMU power control is available, try power cycling
+		if (err)
+		{
+			LOG_INF("Sensor detection failed, attempting IMU power cycle");
+			if (sensor_imu_power_cycle() == 0)
+			{
+				k_msleep(10); // Allow time for power stabilization
+				sensor_imu_dev.addr = 0x00; // Reset address again
+				err = sensor_scan(); // Final retry after power cycle
+				if (!err)
+					LOG_INF("Sensor detection successful after power cycle");
+			}
+		}
 	}
 	sys_interface_suspend();
 //	if (err)
@@ -326,7 +379,7 @@ int sensor_scan(void)
 	{
 		if (mag_id >= (int)ARRAY_SIZE(sensor_mags) || sensor_mags[mag_id] == NULL || sensor_mags[mag_id] == &sensor_mag_none)
 		{
-			sensor_mag = &sensor_mag_none; 
+			sensor_mag = &sensor_mag_none;
 			mag_available = false;
 			LOG_ERR("Magnetometer not supported");
 		}
@@ -338,7 +391,7 @@ int sensor_scan(void)
 	}
 	else
 	{
-		sensor_mag = &sensor_mag_none; 
+		sensor_mag = &sensor_mag_none;
 		mag_available = false; // marked as not available
 	}
 
@@ -375,7 +428,7 @@ int sensor_request_scan(bool force)
 	k_thread_create(&sensor_thread_id, sensor_thread_id_stack, K_THREAD_STACK_SIZEOF(sensor_thread_id_stack), (k_thread_entry_t)sensor_scan_thread, NULL, NULL, NULL, 7, 0, K_NO_WAIT);
 	k_thread_join(&sensor_thread_id, K_FOREVER); // wait for the thread to finish
 	if (sensor_sensor_init && force)
-	{		
+	{
 		k_thread_create(&sensor_thread_id, sensor_thread_id_stack, K_THREAD_STACK_SIZEOF(sensor_thread_id_stack), (k_thread_entry_t)sensor_loop, NULL, NULL, NULL, 7, 0, K_NO_WAIT);
 		LOG_INF("Started sensor loop");
 	}
@@ -640,10 +693,55 @@ void sensor_loop(void)
 		set_status(SYS_STATUS_SENSOR_ERROR, true); // TODO: only handles general init error
 	else
 		main_ok = true;
+
+	// ICM45686 health check timing
+	static int64_t last_imu_health_check = 0;
+	static int health_check_failures = 0;
+	const int64_t HEALTH_CHECK_INTERVAL = 30000; // Check every 30 seconds (increased from 10s)
+	const int MAX_HEALTH_FAILURES = 2; // Reduced from 3 to make it less aggressive
+
 	while (1)
 	{
 		int64_t time_begin = k_uptime_get();
-		if (main_ok)
+
+		// Periodic health check for ICM45686 (especially after wake-up or power events)
+		// Only run if system has been running for at least 60 seconds to avoid startup issues
+		if (main_ok && sensor_imu_id == IMU_ICM45686 &&
+			time_begin > 60000 &&
+			(time_begin - last_imu_health_check) > HEALTH_CHECK_INTERVAL)
+		{
+			last_imu_health_check = time_begin;
+
+			// Only do health check if sensor loop is not currently processing data
+			// This avoids interfering with normal sensor operations
+			int health_result = sensor_imu_recovery_check();
+
+			if (health_result != 0)
+			{
+				health_check_failures++;
+				LOG_WRN("ICM45686 health check failed (%d/%d)", health_check_failures, MAX_HEALTH_FAILURES);
+
+				if (health_check_failures >= MAX_HEALTH_FAILURES)
+				{
+					LOG_ERR("ICM45686 repeatedly failing, setting sensor error status");
+					health_check_failures = 0; // Reset counter
+					set_status(SYS_STATUS_SENSOR_ERROR, true);
+
+					// Don't force restart here - let the error status indicate the problem
+					// The system can still continue to operate, and the error will be visible to the user
+				}
+			}
+			else
+			{
+				// Reset failure counter on successful check
+				if (health_check_failures > 0)
+				{
+					LOG_INF("ICM45686 health check passed, clearing failure count");
+					health_check_failures = 0;
+					set_status(SYS_STATUS_SENSOR_ERROR, false); // Clear error status
+				}
+			}
+		}		if (main_ok)
 		{
 			// Resume devices
 			sys_interface_resume();
@@ -722,7 +820,7 @@ void sensor_loop(void)
 					break;
 				};
 			}
-			
+
 			// Suspend devices
 			sys_interface_suspend();
 
@@ -751,15 +849,15 @@ void sensor_loop(void)
 					float gz = raw_g[2];
 					float g[] = {SENSOR_GYROSCOPE_AXES_ALIGNMENT};
 
-#if CONFIG_SENSOR_USE_SENS_CALIBRATION					
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
 					// Apply sensitivity scaling
 					if (retained) {
 						g[0] *= retained->gyroSensScale[0];
 						g[1] *= retained->gyroSensScale[1];
 						g[2] *= retained->gyroSensScale[2];
 					}
-#endif	
-	
+#endif
+
 					// Process fusion
 					sensor_fusion->update_gyro(g, gyro_actual_time);
 
@@ -770,7 +868,7 @@ void sensor_loop(void)
 						sensor_fusion->get_gyro_bias(g_off);
 						for (int i = 0; i < 3; i++)
 							g_off[i] = g[i] - g_off[i];
-	
+
 						// Get the highest gyro speed
 						float gyro_speed_square = g_off[0] * g_off[0] + g_off[1] * g_off[1] + g_off[2] * g_off[2];
 						if (gyro_speed_square > max_gyro_speed_square)
@@ -1096,4 +1194,138 @@ void main_imu_restart(void)
 {
 	if (main_ok) // only restart fusion if initialized
 		sensor_fusion->init(gyro_actual_time, accel_actual_time, 6 / 1000.0f); // TODO: using default initial time
+}
+
+// IMU recovery function for wake-up issues (especially ICM45686)
+int sensor_imu_recovery_check(void)
+{
+	// Check if IMU is responding properly
+	if (!sensor_sensor_init || sensor_imu_id < 0)
+	{
+		LOG_INF("Sensor not initialized, skipping recovery check");
+		return -1; // Return error without attempting recovery
+	}
+
+	// For ICM45686, test basic register reading to detect clock issues
+	if (sensor_imu_id == IMU_ICM45686)
+	{
+		uint8_t test_reg = 0;
+		int err = 0;
+		int successful_reads = 0;
+
+		// Try reading WHO_AM_I register multiple times to detect communication issues
+		for (int i = 0; i < 3; i++) // Reduced back to 3 tries for normal health check
+		{
+			if (sensor_imu_dev.addr & 0x80) // SPI
+			{
+				err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, 0x72, &test_reg); // ICM45686_WHO_AM_I
+			}
+			else // I2C
+			{
+				struct i2c_dt_spec *i2c_dev = (struct i2c_dt_spec *)&sensor_imu_dev;
+				err = i2c_reg_read_byte(i2c_dev->bus, i2c_dev->addr & 0x7F, 0x72, &test_reg);
+			}
+
+			if (err == 0 && test_reg == 0xE9) // ICM45686 WHO_AM_I value
+			{
+				successful_reads++;
+			}
+
+			if (i < 2) // Don't delay after last attempt
+				k_msleep(1);
+		}
+
+		// Require at least 2 out of 3 successful reads to avoid false positives
+		if (successful_reads >= 2)
+		{
+			LOG_DBG("ICM45686 health check passed (%d/3 successful reads)", successful_reads);
+			return 0; // Communication is working
+		}
+		else
+		{
+			LOG_WRN("ICM45686 communication failed (%d/3 successful reads, last reg=0x%02X, err=%d)",
+					successful_reads, test_reg, err);
+
+			// Only attempt recovery if communication completely failed
+			if (successful_reads == 0)
+			{
+				// Attempt power cycle recovery
+				if (sensor_imu_power_cycle() == 0)
+				{
+					k_msleep(20); // Wait for power cycle to complete
+
+					// Try rescan and return success/failure
+					int rescan_result = sensor_request_scan(true);
+					if (rescan_result == 0)
+					{
+						LOG_INF("ICM45686 power cycle recovery successful");
+						return 0; // Recovery successful
+					}
+					else
+					{
+						LOG_ERR("ICM45686 power cycle recovery failed");
+						return -1; // Recovery failed
+					}
+				}
+				else
+				{
+					LOG_WRN("Power cycle not available, attempting soft reset");
+					// If power cycle not available, try soft reset approach
+					if (sensor_imu_dev.addr & 0x80) // SPI
+					{
+						ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, 0x7F, 0x02); // ICM45686_REG_MISC2 soft reset
+					}
+					k_msleep(10);
+
+					int rescan_result = sensor_request_scan(true);
+					return (rescan_result == 0) ? 0 : -1; // Return based on rescan success
+				}
+			}
+			else
+			{
+				// Partial communication success - just a warning, don't trigger recovery
+				LOG_INF("ICM45686 partial communication issues, monitoring...");
+				return 0; // Don't trigger recovery for partial failures
+			}
+		}
+	}
+
+	return 0; // For non-ICM45686 sensors, always return success
+}
+
+// Proactive ICM45686 startup check and recovery
+void sensor_imu_startup_check(void)
+{
+	if (!sensor_sensor_init || sensor_imu_id != IMU_ICM45686)
+		return;
+
+	LOG_INF("Performing ICM45686 startup health check");
+
+	// Wait a moment for system to stabilize after startup
+	k_msleep(50);
+
+	// Simple startup check - just verify basic communication
+	uint8_t test_reg = 0;
+	int err = 0;
+
+	if (sensor_imu_dev.addr & 0x80) // SPI
+	{
+		err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, 0x72, &test_reg); // ICM45686_WHO_AM_I
+	}
+	else // I2C
+	{
+		struct i2c_dt_spec *i2c_dev = (struct i2c_dt_spec *)&sensor_imu_dev;
+		err = i2c_reg_read_byte(i2c_dev->bus, i2c_dev->addr & 0x7F, 0x72, &test_reg);
+	}
+
+	if (err == 0 && test_reg == 0xE9)
+	{
+		LOG_INF("ICM45686 startup check passed");
+	}
+	else
+	{
+		LOG_WRN("ICM45686 startup check failed (reg=0x%02X, err=%d), will rely on periodic health checks", test_reg, err);
+		// Don't attempt immediate recovery during startup - let the periodic health check handle it
+		// This avoids aggressive recovery attempts that might interfere with normal initialization
+	}
 }

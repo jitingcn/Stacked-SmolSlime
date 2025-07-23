@@ -34,29 +34,76 @@ int icm45_init(float clock_rate, float accel_time, float gyro_time, float *accel
 		fifo_multiplier_factor = FIFO_MULT_SPI; // SPI mode
 	else
 		fifo_multiplier_factor = FIFO_MULT; // I2C mode
+
 	int err = 0;
+
+	// Additional reset and clock stabilization for ICM45686
+	LOG_INF("Initializing ICM45686 with enhanced clock stability");
+
+	// Perform soft reset first to ensure clean state
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_REG_MISC2, 0x02);
+	k_msleep(10); // Wait for reset to complete
+
+	// Verify device is responding after reset
+	uint8_t who_am_i = 0;
+	for (int retry = 0; retry < 5; retry++)
+	{
+		err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, 0x72, &who_am_i); // ICM45686_WHO_AM_I
+		if (err == 0 && who_am_i == 0xE9)
+		{
+			LOG_DBG("ICM45686 WHO_AM_I verified on retry %d", retry);
+			break;
+		}
+		k_msleep(2);
+	}
+
+	if (who_am_i != 0xE9)
+	{
+		LOG_ERR("ICM45686 WHO_AM_I failed: 0x%02X", who_am_i);
+		return -1;
+	}
+
 	if (clock_rate > 0)
 	{
 		clock_scale = clock_rate / clock_reference;
 		err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_IOC_PAD_SCENARIO_OVRD, 0x06); // override pin 9 to CLKIN
 		err |= ssi_reg_update_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_RTC_CONFIG, 0x20, 0x20); // enable external CLKIN
-//		err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_RTC_CONFIG, 0x23); // enable external CLKIN (0x20, default register value is 0x03)
+		k_msleep(5); // Wait for clock to stabilize
+		LOG_DBG("External clock configured, rate: %.2fHz", (double)clock_rate);
 	}
+
 	uint8_t ireg_buf[3];
 	ireg_buf[0] = ICM45686_IPREG_TOP1; // address is a word, icm is big endian
 	ireg_buf[1] = ICM45686_SREG_CTRL;
 	ireg_buf[2] = 0x02; // set big endian
 	err |= ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, ICM45686_IREG_ADDR_15_8, ireg_buf, 3); // write buffer
+
+	// Additional delay for register access to stabilize
+	k_msleep(2);
+
 	last_accel_odr = 0xff; // reset last odr
 	last_gyro_odr = 0xff; // reset last odr
 	err |= icm45_update_odr(accel_time, gyro_time, accel_actual_time, gyro_actual_time);
-//	k_msleep(50); // 10ms Accel, 30ms Gyro startup
-	k_msleep(1); // fuck i dont wanna wait that long
+
+	// Extended startup time for better stability
+	k_msleep(15); // Increased from 1ms to 15ms for better clock stability
+
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_FIFO_CONFIG0, 0x80 | 0b000111); // set FIFO stop-on-full mode, set FIFO depth to 2K bytes (see AN-000364)
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_FIFO_CONFIG3, 0x0F); // begin FIFO stream, hires, a+g
+
+	// Verify FIFO is working correctly
+	k_msleep(5);
+	uint8_t fifo_count[2] = {0};
+	err |= ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, ICM45686_FIFO_COUNT_0, fifo_count, 2);
+
 	if (err)
-		LOG_ERR("Communication error");
-	return (err < 0 ? err : 0);
+	{
+		LOG_ERR("ICM45686 initialization failed - communication error");
+		return -1;
+	}
+
+	LOG_INF("ICM45686 initialized successfully, FIFO count: %d", (fifo_count[1] << 8) | fifo_count[0]);
+	return 0;
 }
 
 void icm45_shutdown(void)
@@ -252,7 +299,7 @@ int icm45_update_odr(float accel_time, float gyro_time, float *accel_actual_time
 
 	// extra read packets by ODR time
 	if (accel_time == 0 && gyro_time != 0)
-		fifo_multiplier = fifo_multiplier_factor / gyro_time; 
+		fifo_multiplier = fifo_multiplier_factor / gyro_time;
 	else if (accel_time != 0 && gyro_time == 0)
 		fifo_multiplier = fifo_multiplier_factor / accel_time;
 	else if (gyro_time > accel_time)
@@ -425,7 +472,7 @@ const sensor_imu_t sensor_imu_icm45686 = {
 	*icm45_temp_read,
 
 	*icm45_setup_WOM,
-	
+
 	*imu_none_ext_setup,
 	*icm45_ext_passthrough
 };

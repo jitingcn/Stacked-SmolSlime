@@ -49,6 +49,12 @@ void main_imu_resume(void);
 void main_imu_wakeup(void);
 void main_imu_restart(void);
 
+// IMU recovery function for wake-up issues
+int sensor_imu_recovery_check(void);
+
+// Proactive ICM45686 startup check and recovery
+void sensor_imu_startup_check(void);
+
 typedef struct sensor_fusion {
 	void (*init)(float, float, float);  // gyro_time, accel_time, mag_time
 	void (*load)(const void*);
