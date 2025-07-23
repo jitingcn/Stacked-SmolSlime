@@ -694,54 +694,10 @@ void sensor_loop(void)
 	else
 		main_ok = true;
 
-	// ICM45686 health check timing
-	static int64_t last_imu_health_check = 0;
-	static int health_check_failures = 0;
-	const int64_t HEALTH_CHECK_INTERVAL = 30000; // Check every 30 seconds (increased from 10s)
-	const int MAX_HEALTH_FAILURES = 2; // Reduced from 3 to make it less aggressive
-
 	while (1)
 	{
 		int64_t time_begin = k_uptime_get();
-
-		// Periodic health check for ICM45686 (especially after wake-up or power events)
-		// Only run if system has been running for at least 60 seconds to avoid startup issues
-		if (main_ok && sensor_imu_id == IMU_ICM45686 &&
-			time_begin > 60000 &&
-			(time_begin - last_imu_health_check) > HEALTH_CHECK_INTERVAL)
-		{
-			last_imu_health_check = time_begin;
-
-			// Only do health check if sensor loop is not currently processing data
-			// This avoids interfering with normal sensor operations
-			int health_result = sensor_imu_recovery_check();
-
-			if (health_result != 0)
-			{
-				health_check_failures++;
-				LOG_WRN("ICM45686 health check failed (%d/%d)", health_check_failures, MAX_HEALTH_FAILURES);
-
-				if (health_check_failures >= MAX_HEALTH_FAILURES)
-				{
-					LOG_ERR("ICM45686 repeatedly failing, setting sensor error status");
-					health_check_failures = 0; // Reset counter
-					set_status(SYS_STATUS_SENSOR_ERROR, true);
-
-					// Don't force restart here - let the error status indicate the problem
-					// The system can still continue to operate, and the error will be visible to the user
-				}
-			}
-			else
-			{
-				// Reset failure counter on successful check
-				if (health_check_failures > 0)
-				{
-					LOG_INF("ICM45686 health check passed, clearing failure count");
-					health_check_failures = 0;
-					set_status(SYS_STATUS_SENSOR_ERROR, false); // Clear error status
-				}
-			}
-		}		if (main_ok)
+		if (main_ok)
 		{
 			// Resume devices
 			sys_interface_resume();
